@@ -1,57 +1,139 @@
-name: Build Android APK
+name: Build BarbellVBT Android APK
 
-on:
+'on':
   push:
-    branches: [ main, master ]
-  workflow_dispatch:  # 允许手动触发
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout code
+      - name: Check out project
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # These are the documented python-for-android Ubuntu prerequisites.
+      # libltdl-dev and libtool provide the Autoconf macros required by libffi.
+      - name: Install Android and Autotools prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+            ant \
+            autoconf \
+            automake \
+            autopoint \
+            build-essential \
+            ccache \
+            cmake \
+            gettext \
+            git \
+            lbzip2 \
+            libffi-dev \
+            libltdl-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libssl-dev \
+            libtinfo6 \
+            libtool \
+            make \
+            m4 \
+            patch \
+            pkg-config \
+            python3-dev \
+            unzip \
+            wget \
+            zip \
+            zlib1g-dev
+
+          echo '--- Verify Libtool/Libltdl packages ---'
+          dpkg-query -W -f='${Package} ${Version}\n' libltdl-dev libtool
+          command -v libtoolize
+          aclocal --print-ac-dir
+          test -f /usr/share/aclocal/libtool.m4
+          test -f /usr/share/aclocal/ltdl.m4
+          grep -R -n --include='*.m4' 'LT_SYS_SYMBOL_USCORE' /usr/share/aclocal
+          echo 'Libtool Autoconf macros are present.'
+
+          # Make the macro directory explicit for autoreconf/aclocal used by libffi.
+          echo 'ACLOCAL_PATH=/usr/share/aclocal:/usr/share/aclocal-1.16' >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Python 3.11 is the host interpreter for Buildozer.
+      # The Android app's own Python/hostpython versions are pinned together
+      # in buildozer.spec to 3.14.2 for python-for-android develop.
+      - name: Set up host Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Buildozer dependencies
+      - name: Install Rust toolchain
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            python3-pip autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            libtinfo6 cmake libffi-dev libssl-dev \
-            libsqlite3-dev libgdbm-dev libbz2-dev \
-            libexpat1-dev liblzma-dev libreadline-dev
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
 
-      - name: Install Buildozer
+      - name: Check Android project configuration
+        shell: bash
         run: |
-          pip install --upgrade pip
-          pip install buildozer cython==0.29.36
+          set -euo pipefail
+          test -f main.py
+          test -f buildozer.spec
+          grep -Eq '^requirements[[:space:]]*=.*python3==3\.14\.2.*hostpython3==3\.14\.2' buildozer.spec
+          grep -Eq '^p4a\.branch[[:space:]]*=[[:space:]]*develop' buildozer.spec
+          echo 'Project files and Python/p4a version pins look consistent.'
+          grep -E '^(requirements|p4a\.branch|android\.api|android\.minapi|android\.ndk|android\.archs)[[:space:]]*=' buildozer.spec
 
-      - name: Cache Buildozer
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.buildozer
-            .buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            ${{ runner.os }}-buildozer-
+      - name: Install Buildozer in an isolated virtual environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install 'Cython==0.29.34' 'buildozer==1.5.0'
+          python --version
+          python -m pip show buildozer Cython
+          buildozer --version
 
       - name: Build APK
+        shell: bash
         run: |
-          export PATH=$PATH:~/.local/bin
-          buildozer android debug
+          set -euxo pipefail
+          source .venv/bin/activate
+          echo "Buildozer host Python: $(python --version)"
+          echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+          echo "ACLOCAL_PATH=$ACLOCAL_PATH"
+          buildozer -v android debug 2>&1 | tee buildozer-build.log
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: BarbellVBT-APK
+          name: BarbellVBT-debug-APK
           path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BarbellVBT-build-log
+          path: buildozer-build.log
+          if-no-files-found: ignore
+          retention-days: 14
