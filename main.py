@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """BarbellVBT 简洁增强版：训练视频分析 + 训练记录管理（测试版本）。"""
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 import csv
 import json
@@ -37,17 +37,17 @@ from kivy.utils import platform as kivy_platform
 
 # Android 上 Kivy 默认 Roboto 字体可能缺少简体中文汉字，导致文字显示为空白方框。
 # 优先使用手机系统自带的 Noto CJK 中文字体，不在 APK 中额外打包字体文件。
-# 统一界面主题：深色石墨底 + 青绿色强调色，避免默认 Kivy 按钮和输入框的系统感。
+# 统一界面主题：深海军蓝背景 + 蓝色强调色，保留高对比度，方便训练场景查看。
 UI_THEME = {
-    "background": (0.055, 0.071, 0.090, 1),
-    "surface": (0.105, 0.133, 0.165, 1),
-    "surface_alt": (0.135, 0.169, 0.205, 1),
-    "surface_soft": (0.165, 0.202, 0.239, 1),
-    "text": (0.925, 0.949, 0.965, 1),
-    "muted": (0.650, 0.710, 0.755, 1),
-    "accent": (0.145, 0.765, 0.610, 1),
-    "accent_dark": (0.090, 0.430, 0.355, 1),
-    "blue": (0.235, 0.565, 0.930, 1),
+    "background": (0.025, 0.055, 0.120, 1),
+    "surface": (0.055, 0.100, 0.190, 1),
+    "surface_alt": (0.075, 0.140, 0.250, 1),
+    "surface_soft": (0.100, 0.190, 0.320, 1),
+    "text": (0.935, 0.960, 1.000, 1),
+    "muted": (0.640, 0.735, 0.860, 1),
+    "accent": (0.245, 0.585, 0.985, 1),
+    "accent_dark": (0.105, 0.330, 0.675, 1),
+    "blue": (0.245, 0.585, 0.985, 1),
     "amber": (0.920, 0.650, 0.245, 1),
     "red": (0.850, 0.315, 0.335, 1),
 }
@@ -1343,7 +1343,7 @@ class BarbellVBTApp(App):
 
     def _copy_android_uri_to_private_file(self, uri_string):
         """Copy a content:// document to a normal seekable file for OpenCV/VideoCapture."""
-        from jnius import autoclass, jarray
+        from jnius import autoclass
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         Uri = autoclass("android.net.Uri")
         activity_obj = PythonActivity.mActivity
@@ -1367,7 +1367,8 @@ class BarbellVBTApp(App):
         import_dir = os.path.join(self.user_data_dir, "imports")
         os.makedirs(import_dir, exist_ok=True)
         destination = os.path.join(import_dir, f"video_{int(time.time())}_{uuid.uuid4().hex[:8]}{extension}")
-        buffer = jarray("b")([0] * 65536)
+        # PyJNIus 会把 Python bytearray 转换为 Java byte[]，无需导入 jarray。
+        buffer = bytearray(65536)
         total = 0
         try:
             with open(destination, "wb") as output:
@@ -1377,7 +1378,7 @@ class BarbellVBTApp(App):
                         break
                     if count == 0:
                         continue
-                    output.write(bytes((int(buffer[i]) & 0xFF) for i in range(count)))
+                    output.write(buffer[:count])
                     total += count
             if total < 1024:
                 raise IOError("选择的文件为空或不是有效视频文件")
