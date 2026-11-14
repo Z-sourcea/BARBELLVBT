@@ -11,7 +11,7 @@ source.include_exts = py,png,jpg,jpeg,kv,atlas,txt,md
 source.exclude_exts = spec
 source.exclude_dirs = .git,.github,.buildozer,bin,venv,__pycache__,.venv,tests
 
-version = 0.3.3
+version = 0.3.4
 
 # python-for-android develop 当前的 Python 与 hostpython 必须同版本。
 # Kivy 不锁死版本，使用 p4a 自带并测试过的 Android recipe。
