@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 """BarbellVBT 简洁增强版：训练视频分析 + 训练记录管理（测试版本）。"""
 
-__version__ = "0.3.1"
+__version__ = "0.3.3"
 
 import csv
 import json
 import math
 import os
 import threading
+import time
+import traceback
+import uuid
 from datetime import datetime
 
 import cv2
@@ -23,6 +26,7 @@ from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.slider import Slider
+from kivy.graphics import Color, RoundedRectangle
 from kivy.graphics.texture import Texture
 from kivy.uix.label import Label as _KivyLabel
 from kivy.uix.popup import Popup as _KivyPopup
@@ -33,6 +37,22 @@ from kivy.utils import platform as kivy_platform
 
 # Android 上 Kivy 默认 Roboto 字体可能缺少简体中文汉字，导致文字显示为空白方框。
 # 优先使用手机系统自带的 Noto CJK 中文字体，不在 APK 中额外打包字体文件。
+# 统一界面主题：深色石墨底 + 青绿色强调色，避免默认 Kivy 按钮和输入框的系统感。
+UI_THEME = {
+    "background": (0.055, 0.071, 0.090, 1),
+    "surface": (0.105, 0.133, 0.165, 1),
+    "surface_alt": (0.135, 0.169, 0.205, 1),
+    "surface_soft": (0.165, 0.202, 0.239, 1),
+    "text": (0.925, 0.949, 0.965, 1),
+    "muted": (0.650, 0.710, 0.755, 1),
+    "accent": (0.145, 0.765, 0.610, 1),
+    "accent_dark": (0.090, 0.430, 0.355, 1),
+    "blue": (0.235, 0.565, 0.930, 1),
+    "amber": (0.920, 0.650, 0.245, 1),
+    "red": (0.850, 0.315, 0.335, 1),
+}
+
+
 ANDROID_CJK_FONT_CANDIDATES = (
     "/system/fonts/NotoSansCJK-Regular.ttc",
     "/system/fonts/NotoSansSC-Regular.otf",
@@ -56,24 +76,40 @@ UI_FONT_NAME = find_ui_font()
 class Label(_KivyLabel):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("font_name", UI_FONT_NAME)
+        kwargs.setdefault("color", UI_THEME["text"])
         super().__init__(*args, **kwargs)
 
 
 class Button(_KivyButton):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("font_name", UI_FONT_NAME)
+        kwargs.setdefault("background_normal", "")
+        kwargs.setdefault("background_down", "")
+        kwargs.setdefault("background_color", UI_THEME["accent_dark"])
+        kwargs.setdefault("color", UI_THEME["text"])
+        kwargs.setdefault("bold", True)
         super().__init__(*args, **kwargs)
 
 
 class TextInput(_KivyTextInput):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("font_name", UI_FONT_NAME)
+        kwargs.setdefault("background_normal", "")
+        kwargs.setdefault("background_active", "")
+        kwargs.setdefault("background_color", UI_THEME["surface_alt"])
+        kwargs.setdefault("foreground_color", UI_THEME["text"])
+        kwargs.setdefault("hint_text_color", UI_THEME["muted"])
+        kwargs.setdefault("cursor_color", UI_THEME["accent"])
+        kwargs.setdefault("padding", (dp(10), dp(10)))
         super().__init__(*args, **kwargs)
 
 
 class SpinnerOption(_KivySpinnerOption):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("font_name", UI_FONT_NAME)
+        kwargs.setdefault("background_normal", "")
+        kwargs.setdefault("background_color", UI_THEME["surface_alt"])
+        kwargs.setdefault("color", UI_THEME["text"])
         super().__init__(*args, **kwargs)
 
 
@@ -81,6 +117,10 @@ class Spinner(_KivySpinner):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("font_name", UI_FONT_NAME)
         kwargs.setdefault("option_cls", SpinnerOption)
+        kwargs.setdefault("background_normal", "")
+        kwargs.setdefault("background_down", "")
+        kwargs.setdefault("background_color", UI_THEME["surface_alt"])
+        kwargs.setdefault("color", UI_THEME["text"])
         super().__init__(*args, **kwargs)
 
 
@@ -88,6 +128,22 @@ class Popup(_KivyPopup):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("title_font", UI_FONT_NAME)
         super().__init__(*args, **kwargs)
+
+
+class Panel(BoxLayout):
+    """Rounded card background for the mobile UI."""
+    def __init__(self, *args, panel_color=None, radius_dp=16, **kwargs):
+        self._panel_color = panel_color or UI_THEME["surface"]
+        self._radius_dp = radius_dp
+        super().__init__(*args, **kwargs)
+        with self.canvas.before:
+            Color(*self._panel_color)
+            self._panel_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(self._radius_dp)])
+        self.bind(pos=self._update_panel_rect, size=self._update_panel_rect)
+
+    def _update_panel_rect(self, *_args):
+        self._panel_rect.pos = self.pos
+        self._panel_rect.size = self.size
 
 
 
@@ -134,6 +190,28 @@ TRACKING_MODES = (
 )
 
 EXERCISES = ["深蹲", "前蹲", "硬拉", "高翻", "抓举", "卧推", "其他"]
+
+# 手机端逐帧追踪时先缩小检测画面，避免对 4K 原始帧直接做 HSV/形态学处理导致内存峰值过高。
+# 检测坐标会映射回原视频像素坐标，再使用原视频标定矩阵计算。
+ANDROID_ANALYSIS_MAX_DIMENSION = 1280
+
+
+def prepare_detection_frame(frame, max_dimension=ANDROID_ANALYSIS_MAX_DIMENSION):
+    """Return a memory-bounded frame for detection and scale factors back to source pixels."""
+    if frame is None or getattr(frame, "ndim", 0) < 2:
+        raise ValueError("视频帧为空或格式无效")
+    source_h, source_w = frame.shape[:2]
+    if source_w <= 0 or source_h <= 0:
+        raise ValueError("视频帧尺寸无效")
+    scale = min(1.0, float(max_dimension) / float(max(source_w, source_h)))
+    if scale < 1.0:
+        detect_w = max(1, int(round(source_w * scale)))
+        detect_h = max(1, int(round(source_h * scale)))
+        detection_frame = cv2.resize(frame, (detect_w, detect_h), interpolation=cv2.INTER_AREA)
+    else:
+        detection_frame = frame
+        detect_w, detect_h = source_w, source_h
+    return detection_frame, source_w / float(detect_w), source_h / float(detect_h)
 
 # 阶段说明用于帮助训练者理解动作和人工回看视频。
 # 当前算法只追踪标记点并切分连续运动片段，不会自动判断具体技术阶段。
@@ -452,6 +530,27 @@ class VideoAnalyzer:
                 vertical_direction = "下降为主"
             else:
                 vertical_direction = "上升与下降混合"
+
+        # 将单个连续运动片段沿实际运动方向（而非固定图像上下方向）按垂直行程均分为起始/中段/末端。
+        # 这是“行程分区速度”，不是自动识别的高翻第一拉/第二拉或解剖学阶段。
+        range_zone_speeds = {"lower": None, "middle": None, "upper": None}
+        range_zone_counts = {"lower": 0, "middle": 0, "upper": 0}
+        vertical_range = float(np.max(world_y) - np.min(world_y))
+        if vertical_direction in ("上升为主", "下降为主") and vertical_range >= 0.02:
+            if vertical_direction == "上升为主":
+                progress = (world_y - float(np.min(world_y))) / vertical_range
+            else:
+                progress = (float(np.max(world_y)) - world_y) / vertical_range
+            zone_masks = {
+                "lower": (progress >= 0.0) & (progress < (1.0 / 3.0)),
+                "middle": (progress >= (1.0 / 3.0)) & (progress < (2.0 / 3.0)),
+                "upper": (progress >= (2.0 / 3.0)) & (progress <= 1.0),
+            }
+            for zone_name, zone_mask in zone_masks.items():
+                sample_count = int(np.count_nonzero(zone_mask))
+                range_zone_counts[zone_name] = sample_count
+                if sample_count >= 3:
+                    range_zone_speeds[zone_name] = round(float(np.mean(speeds[zone_mask])), 3)
         return {
             "rep": number,
             "direction": vertical_direction,
@@ -464,18 +563,34 @@ class VideoAnalyzer:
             "start_time": round(float(times[0]), 2),
             "end_time": round(float(times[-1]), 2),
             "tracked_frames": int(len(segment)),
+            "range_zone_speeds_m_s": range_zone_speeds,
+            "range_zone_sample_counts": range_zone_counts,
+            "range_zone_method": "垂直行程等分三段；不是技术阶段自动识别",
         }
 
     def analyze(self, video_path, callback=None, camera_setup=None):
         if self.homography is None:
             return {"error": "尚未完成有效标定。请先在视频画面中完成两点比例标定或四点透视标定。"}
+        try:
+            cv2.setNumThreads(2)
+        except Exception:
+            pass
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return {"error": "无法打开视频。请尝试 MP4 格式，并确认视频文件没有损坏。"}
+            cap.release()
+            return {"error": "无法打开视频。请尝试使用手机相册导出 H.264 编码的 MP4 文件，并确认视频没有损坏。"}
         fps = safe_float(cap.get(cv2.CAP_PROP_FPS), 30.0) or 30.0
         if not math.isfinite(fps) or fps <= 0:
             fps = 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if video_width <= 0 or video_height <= 0:
+            cap.release()
+            return {"error": "无法读取视频分辨率。请尝试将视频转换为常规 H.264 MP4 后重新导入。"}
+        if callback:
+            callback({"stage": "video_opened", "fps": fps, "width": video_width, "height": video_height,
+                      "total_frames": total_frames})
         tracker = BarbellTracker(self.marker_color, fps=fps)
         tracker2 = BarbellTracker(self.marker2_color, fps=fps) if self.tracking_mode == "dual" else None
         # Each row: time, representative image center, frame, primary area,
@@ -493,8 +608,14 @@ class VideoAnalyzer:
                     break
                 frame_index = frame_count
                 timestamp = frame_index / fps
-                center1 = tracker.detect(frame, frame_index=frame_index)
-                center2 = tracker2.detect(frame, frame_index=frame_index) if tracker2 is not None else None
+                detect_frame, restore_x, restore_y = prepare_detection_frame(
+                    frame, ANDROID_ANALYSIS_MAX_DIMENSION
+                )
+
+                center1_small = tracker.detect(detect_frame, frame_index=frame_index)
+                center2_small = tracker2.detect(detect_frame, frame_index=frame_index) if tracker2 is not None else None
+                center1 = (int(round(center1_small[0] * restore_x)), int(round(center1_small[1] * restore_y))) if center1_small is not None else None
+                center2 = (int(round(center2_small[0] * restore_x)), int(round(center2_small[1] * restore_y))) if center2_small is not None else None
                 if center1 is not None:
                     marker1_found += 1
                 if tracker2 is not None and center2 is not None:
@@ -526,6 +647,8 @@ class VideoAnalyzer:
                 frame_count += 1
                 if callback and frame_count % 30 == 0 and total_frames > 0:
                     callback({"progress": min(100.0, frame_count / total_frames * 100.0)})
+                if callback and frame_count % 300 == 0:
+                    callback({"stage": "frames", "frame_count": frame_count, "total_frames": total_frames})
         except Exception as exc:
             return {"error": f"读取视频时出错：{type(exc).__name__}: {exc}"}
         finally:
@@ -677,6 +800,9 @@ class VideoAnalyzer:
         self.results = results
         self.summary = {
             "fps": round(float(fps), 2),
+            "video_width": int(video_width),
+            "video_height": int(video_height),
+            "analysis_max_dimension": int(ANDROID_ANALYSIS_MAX_DIMENSION),
             "total_frames": int(frame_count),
             "tracked_frames": int(len(points)),
             "tracking_coverage_pct": round(float(coverage), 1),
@@ -758,19 +884,58 @@ class VideoAnalyzer:
             writer.writerow(["平均垂直速度(m/s)", summary.get("mean_velocity", "")])
             writer.writerow(["峰值垂直速度(m/s)", summary.get("peak_velocity", "")])
             writer.writerow([])
-            writer.writerow(["运动片段", "主要方向", "峰值垂直速度(m/s)", "平均垂直速度(m/s)", "垂直位移(m)", "水平漂移(m)", "二维路径长度(m)", "持续时间(s)", "开始时间(s)", "结束时间(s)", "相对最快同方向片段速度下降(%)"])
+            writer.writerow(["运动片段", "主要方向", "峰值垂直速度(m/s)", "平均垂直速度(m/s)", "垂直位移(m)", "水平漂移(m)", "二维路径长度(m)", "持续时间(s)", "开始时间(s)", "结束时间(s)", "相对最快同方向片段速度下降(%)", "行程起始1/3平均速度(m/s)", "行程中段1/3平均速度(m/s)", "行程末端1/3平均速度(m/s)"])
             for item in results:
                 writer.writerow([
                     item["rep"], item["direction"], item["peak_velocity"], item["mean_velocity"],
                     item["displacement"], item["horizontal_drift"], item["path_length_2d"],
                     item["duration"], item["start_time"], item["end_time"], item["velocity_loss_pct"],
+                    item.get("range_zone_speeds_m_s", {}).get("lower"),
+                    item.get("range_zone_speeds_m_s", {}).get("middle"),
+                    item.get("range_zone_speeds_m_s", {}).get("upper"),
                 ])
         return filepath
 
 
 class BarbellVBTApp(App):
+    ANDROID_VIDEO_REQUEST_CODE = 7312
+
+    def _diagnostic_path(self):
+        base_dir = getattr(self, "user_data_dir", None)
+        if not base_dir:
+            base_dir = os.path.join(os.path.expanduser("~"), ".barbellvbt")
+        return os.path.join(base_dir, "analysis_debug.log")
+
+    def _write_diagnostic(self, message):
+        """Write a small local diagnostic log; this survives an app restart after Android kills the process."""
+        try:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            with open(self._diagnostic_path(), "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+        except Exception:
+            pass
+
+    def _show_diagnostics(self, _instance=None):
+        """Show recent diagnostic lines so a user can screenshot them if analysis still exits."""
+        try:
+            path = self._diagnostic_path()
+            if not os.path.isfile(path):
+                text = "目前没有诊断日志。"
+            else:
+                with open(path, "r", encoding="utf-8") as log_file:
+                    lines = log_file.readlines()[-80:]
+                text = "".join(lines) or "诊断日志为空。"
+        except Exception as exc:
+            text = f"读取诊断日志失败：{type(exc).__name__}: {exc}"
+        scroll = ScrollView()
+        label = Label(text=text, font_size="11sp", halign="left", valign="top", size_hint_y=None)
+        label.bind(size=lambda obj, size: setattr(obj, "text_size", (max(size[0] - dp(12), 0), None)))
+        label.bind(texture_size=lambda obj, size: setattr(obj, "height", size[1] + dp(20)))
+        scroll.add_widget(label)
+        Popup(title="分析诊断日志（最近 80 行）", content=scroll, size_hint=(0.96, 0.88)).open()
+
     def build(self):
-        self.title = "BarbellVBT 杠铃速度分析"
+        self.title = "BarbellVBT 篮球力量表现分析"
         self.calibration = None
         self.camera_setup = {}
         self.calibration_label = "尚未标定：先选择视频，再完成两点或四点标定。"
@@ -798,229 +963,264 @@ class BarbellVBTApp(App):
         self._preview_marker2_segments = []
         self._preview_is_dual = False
         self._preview_display_segments = []
+        self._write_diagnostic(f"APP_BUILD version={__version__} platform={kivy_platform}")
 
-        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(7))
-        self.scroll = ScrollView()
-        content = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None, padding=(0, 0, 0, dp(8)))
+        root = BoxLayout(orientation="vertical", padding=(dp(10), dp(8)), spacing=dp(6))
+        with root.canvas.before:
+            Color(*UI_THEME["background"])
+            self._root_bg = RoundedRectangle(pos=root.pos, size=root.size, radius=[0])
+        root.bind(pos=lambda obj, *_: setattr(self._root_bg, "pos", obj.pos),
+                  size=lambda obj, *_: setattr(self._root_bg, "size", obj.size))
+
+        self.scroll = ScrollView(do_scroll_x=False, bar_width=dp(4),
+                                  bar_color=UI_THEME["accent"], bar_inactive_color=UI_THEME["surface_soft"])
+        content = BoxLayout(orientation="vertical", spacing=dp(11), size_hint_y=None,
+                            padding=(dp(2), dp(4), dp(2), dp(18)))
         content.bind(minimum_height=content.setter("height"))
 
-        title = Label(
-            text="BARBELL VBT 0.3.1\n杠铃视频分析（双端标记辅助）",
-            font_size="21sp", bold=True, size_hint_y=None, height=dp(70),
-        )
-        content.add_widget(title)
-        subtitle = Label(
-            text="上传训练视频 / 计算速度 / 保存训练记录",
-            font_size="13sp", size_hint_y=None, height=dp(28),
-        )
-        content.add_widget(subtitle)
+        def panel(title=None, subtitle=None, panel_color=None):
+            card = Panel(orientation="vertical", spacing=dp(8), padding=(dp(13), dp(12)),
+                         size_hint_y=None, panel_color=panel_color or UI_THEME["surface"])
+            card.bind(minimum_height=card.setter("height"))
+            if title:
+                head = Label(text=title, bold=True, font_size="15sp", color=UI_THEME["text"],
+                             halign="left", valign="middle", size_hint_y=None, height=dp(25))
+                self._wrap_label(head)
+                card.add_widget(head)
+            if subtitle:
+                sub = Label(text=subtitle, font_size="11sp", color=UI_THEME["muted"],
+                            halign="left", valign="middle", size_hint_y=None, height=dp(34))
+                self._wrap_label(sub)
+                card.add_widget(sub)
+            return card
 
-        content.add_widget(self._section_label("01 训练信息"))
-        self.athlete_input = self._input("训练者（可不填）", height=42)
-        content.add_widget(self.athlete_input)
+        def small_label(text, height=28, font_size="12sp", color=None, bold=False, halign="left"):
+            label = Label(text=text, size_hint_y=None, height=dp(height), font_size=font_size,
+                          color=color or UI_THEME["muted"], bold=bold, halign=halign, valign="middle")
+            self._wrap_label(label)
+            return label
 
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        self.exercise_spinner = Spinner(text="深蹲", values=EXERCISES, size_hint_x=0.58)
-        self.load_input = self._input("负荷 kg（可不填）", height=44, input_filter="float")
+        # Header / product identity
+        hero = panel(panel_color=UI_THEME["surface"])
+        hero_top = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(6))
+        hero_top.add_widget(Label(text="BARBELLVBT", bold=True, font_size="13sp",
+                                  color=UI_THEME["accent"], halign="left"))
+        hero_top.add_widget(Label(text="VERSION 0.3.3", font_size="10sp",
+                                  color=UI_THEME["muted"], halign="right"))
+        hero.add_widget(hero_top)
+        hero.add_widget(Label(text="力量训练表现分析", font_size="23sp", bold=True,
+                              color=UI_THEME["text"], halign="left", size_hint_y=None, height=dp(36)))
+        hero.add_widget(small_label("视频测量 · 杠铃轨迹 · 行程分区速度 · 训练记录", height=dp(24),
+                                    font_size="12sp", color=UI_THEME["muted"]))
+        content.add_widget(hero)
+
+        # Session setup
+        setup = panel("01 训练信息", "先填写运动员和训练内容；负荷、训练者和备注可以留空。")
+        self.athlete_input = self._input("运动员姓名或编号（可不填）", height=42)
+        setup.add_widget(self.athlete_input)
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.exercise_spinner = Spinner(text="深蹲", values=EXERCISES, size_hint_x=0.58, font_size="13sp")
+        self.load_input = self._input("负荷 kg", height=44, input_filter="float")
         row.add_widget(self.exercise_spinner)
         row.add_widget(self.load_input)
-        content.add_widget(row)
-        self.notes_input = TextInput(
-            hint_text="训练备注（可不填，例如 RPE、训练计划）",
-            multiline=True, size_hint_y=None, height=dp(58),
-        )
-        content.add_widget(self.notes_input)
+        setup.add_widget(row)
+        self.notes_input = TextInput(hint_text="训练备注：RPE、训练目标或其他说明", multiline=True,
+                                     size_hint_y=None, height=dp(58), font_size="13sp")
+        setup.add_widget(self.notes_input)
+        content.add_widget(setup)
 
-        content.add_widget(self._section_label("02 当前动作的阶段说明"))
-        self.guide_label = Label(
-            text="", size_hint_y=None, height=dp(230), font_size="12sp",
-            halign="left", valign="top",
-        )
-        self._wrap_label(self.guide_label)
-        self.guide_label.bind(
-            texture_size=lambda obj, size: setattr(obj, "height", max(dp(230), size[1] + dp(18)))
-        )
-        content.add_widget(self.guide_label)
-        self.exercise_spinner.bind(text=self._on_exercise_change)
-        self._on_exercise_change(self.exercise_spinner, self.exercise_spinner.text)
-
-        content.add_widget(self._section_label("03 视频与识别设置"))
-        self.marker_mode_spinner = Spinner(
-            text=TRACKING_MODES[0], values=TRACKING_MODES,
-            size_hint_y=None, height=dp(44), font_size="13sp"
-        )
+        # Video and tracking workflow
+        workflow = panel("02 视频与追踪设置", "建议先固定手机，再选择视频和完成标定；正侧面优先使用单端标记。")
+        self.marker_mode_spinner = Spinner(text=TRACKING_MODES[0], values=TRACKING_MODES,
+                                           size_hint_y=None, height=dp(44), font_size="13sp")
         self.marker_mode_spinner.bind(text=self._on_tracking_mode_change)
-        content.add_widget(self.marker_mode_spinner)
-        self.marker1_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
-        self.marker1_caption = Label(text="追踪标记颜色", size_hint_x=0.34, font_size="12sp")
-        self.marker_spinner = Spinner(text=self.marker_label, values=list(COLOR_PRESETS.keys()), size_hint_x=0.66)
+        workflow.add_widget(self.marker_mode_spinner)
+
+        self.marker1_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(7))
+        self.marker1_caption = Label(text="第一端颜色", size_hint_x=0.32, font_size="12sp",
+                                     color=UI_THEME["muted"], halign="left")
+        self.marker_spinner = Spinner(text=self.marker_label, values=list(COLOR_PRESETS.keys()),
+                                      size_hint_x=0.68, font_size="12sp")
         self.marker1_row.add_widget(self.marker1_caption)
         self.marker1_row.add_widget(self.marker_spinner)
-        content.add_widget(self.marker1_row)
-        self.marker2_row = BoxLayout(size_hint_y=None, height=0, spacing=dp(6), opacity=0, disabled=True)
-        self.marker2_caption = Label(text="第二端颜色", size_hint_x=0.34, font_size="12sp")
-        self.marker2_spinner = Spinner(text=self.marker2_label, values=list(COLOR_PRESETS.keys()), size_hint_x=0.66)
+        workflow.add_widget(self.marker1_row)
+
+        self.marker2_row = BoxLayout(size_hint_y=None, height=0, spacing=dp(7), opacity=0, disabled=True)
+        self.marker2_caption = Label(text="第二端颜色", size_hint_x=0.32, font_size="12sp",
+                                     color=UI_THEME["muted"], halign="left")
+        self.marker2_spinner = Spinner(text=self.marker2_label, values=list(COLOR_PRESETS.keys()),
+                                       size_hint_x=0.68, font_size="12sp")
         self.marker2_row.add_widget(self.marker2_caption)
         self.marker2_row.add_widget(self.marker2_spinner)
-        content.add_widget(self.marker2_row)
-        self.marker_mode_help = Label(
-            text="正侧面拍摄推荐单端标记：在靠近镜头的一侧选择一个清晰标记即可。",
-            size_hint_y=None, height=dp(46), font_size="11sp", halign="left", valign="middle"
-        )
-        self._wrap_label(self.marker_mode_help)
-        content.add_widget(self.marker_mode_help)
-        self.select_btn = Button(text="1. 选择训练视频", size_hint_y=None, height=dp(48), font_size="16sp")
+        workflow.add_widget(self.marker2_row)
+
+        self.marker_mode_help = small_label(
+            "单端：正侧面推荐，只贴一个清晰彩色标记。双端：斜向辅助，杠铃两端使用不同颜色；双端中点仍是二维近似，不是三维重建。",
+            height=48, font_size="11sp")
+        workflow.add_widget(self.marker_mode_help)
+
+        self.select_btn = Button(text="选择训练视频", size_hint_y=None, height=dp(48),
+                                 font_size="15sp", background_color=UI_THEME["blue"])
         self.select_btn.bind(on_press=self.open_filechooser)
-        content.add_widget(self.select_btn)
-        self.video_label = Label(text="还没有选择视频", size_hint_y=None, height=dp(30), font_size="12sp")
-        content.add_widget(self.video_label)
+        workflow.add_widget(self.select_btn)
+        self.video_label = small_label("尚未选择视频", height=34, font_size="11sp")
+        workflow.add_widget(self.video_label)
 
-        self.calibration_status_label = Label(
-            text=self.calibration_label, size_hint_y=None, height=dp(48), font_size="12sp", halign="left", valign="middle"
-        )
-        self._wrap_label(self.calibration_status_label)
-        content.add_widget(self.calibration_status_label)
-        row2 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
-        self.calibrate_btn = Button(text="2. 拍摄角度与标定", disabled=True, font_size="14sp")
+        self.calibration_status_label = small_label(self.calibration_label, height=46, font_size="11sp")
+        workflow.add_widget(self.calibration_status_label)
+        action_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        self.calibrate_btn = Button(text="拍摄角度与标定", disabled=True, font_size="13sp",
+                                    background_color=UI_THEME["surface_soft"])
         self.calibrate_btn.bind(on_press=self.open_calibration)
-        row2.add_widget(self.calibrate_btn)
-        self.analyze_btn = Button(text="3. 开始分析", disabled=True, font_size="16sp")
+        self.analyze_btn = Button(text="开始分析", disabled=True, font_size="14sp",
+                                  background_color=UI_THEME["accent_dark"])
         self.analyze_btn.bind(on_press=self.start_analysis)
-        row2.add_widget(self.analyze_btn)
-        content.add_widget(row2)
-        self.camera_hint_label = Label(
-            text="建议：手机固定在三脚架上，正侧面拍摄，镜头高度接近杠铃活动范围中点，保持画面水平。",
-            size_hint_y=None, height=dp(48), font_size="11sp", halign="left", valign="middle"
-        )
-        self._wrap_label(self.camera_hint_label)
-        content.add_widget(self.camera_hint_label)
+        action_row.add_widget(self.calibrate_btn)
+        action_row.add_widget(self.analyze_btn)
+        workflow.add_widget(action_row)
 
-        self.status_label = Label(
-            text=("字体状态：已加载手机系统中文字体。请把鲜明颜色标记贴在杠铃片上，手机固定在侧面拍摄。" if UI_FONT_NAME != "Roboto" else "字体状态：未找到专用中文字体，当前使用默认字体。若汉字仍显示方框，请反馈手机系统版本。"),
-            size_hint_y=None, height=dp(56), font_size="12sp", halign="left", valign="middle",
-        )
-        self._wrap_label(self.status_label)
-        content.add_widget(self.status_label)
+        self.camera_hint_label = small_label(
+            "拍摄建议：手机固定在三脚架上，镜头尽量正对主要运动平面，高度接近杠铃活动范围中点；避免手持跟拍和中途变焦。",
+            height=45, font_size="11sp")
+        workflow.add_widget(self.camera_hint_label)
 
-        content.add_widget(self._section_label("04 杠铃轨迹视频回放"))
-        self.preview_help = Label(
-            text="分析完成后，可在原视频上查看轨迹。单端模式：绿色线=标记点轨迹。双端模式：蓝线/橙线=两端轨迹，绿线=两端图像中点轨迹，当前帧会显示杆轴连线。双端中点是二维近似，不是三维重建。",
-            size_hint_y=None, height=dp(56), font_size="12sp", halign="left", valign="middle",
-        )
-        self._wrap_label(self.preview_help)
-        content.add_widget(self.preview_help)
-        self.preview_image = KivyImage(
-            size_hint_y=None, height=dp(220), fit_mode="contain",
-        )
-        content.add_widget(self.preview_image)
-        self.preview_status = Label(
-            text="请先完成视频分析。这里会显示叠加轨迹后的原视频。",
-            size_hint_y=None, height=dp(44), font_size="12sp", halign="left", valign="middle",
-        )
-        self._wrap_label(self.preview_status)
-        content.add_widget(self.preview_status)
-        self.preview_slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(32), disabled=True)
+        self.status_label = small_label(
+            "已加载中文字体。请选择训练视频并完成标定。分析结果受拍摄角度、帧率、标记识别和标定质量影响。",
+            height=55, font_size="11sp", color=UI_THEME["accent"])
+        workflow.add_widget(self.status_label)
+        diagnostics_btn = Button(text="查看分析诊断信息", size_hint_y=None, height=dp(36),
+                                 font_size="11sp", background_color=UI_THEME["surface_alt"])
+        diagnostics_btn.bind(on_press=self._show_diagnostics)
+        workflow.add_widget(diagnostics_btn)
+        content.add_widget(workflow)
+
+        # Summary / KPI cards
+        summary_card = panel("03 本次表现概览", "结果只对本次视频和当前标定条件负责；追踪覆盖率不等于测量准确度。")
+        self.metrics_grid = GridLayout(cols=2, spacing=dp(7), size_hint_y=None, height=dp(258))
+        self.metric_labels = {}
+        metric_specs = [
+            ("avg", "平均垂直速度", "m/s"),
+            ("peak", "峰值垂直速度", "m/s"),
+            ("count", "连续运动片段", "段"),
+            ("coverage", "追踪覆盖率", "%"),
+            ("dualcoverage", "双端配对率", "%"),
+            ("spacingcv", "两端间距 CV", "%"),
+        ]
+        for key, caption, unit in metric_specs:
+            tile = Panel(orientation="vertical", padding=(dp(9), dp(7)), spacing=dp(2),
+                         size_hint_y=None, height=dp(78), panel_color=UI_THEME["surface_alt"])
+            tile.add_widget(Label(text=caption, font_size="10sp", color=UI_THEME["muted"],
+                                  halign="left", size_hint_y=None, height=dp(20)))
+            value = Label(text="—", font_size="19sp", bold=True, color=UI_THEME["text"],
+                          halign="left", size_hint_y=None, height=dp(30))
+            tile.add_widget(value)
+            tile.add_widget(Label(text=unit, font_size="9sp", color=UI_THEME["muted"],
+                                  halign="left", size_hint_y=None, height=dp(13)))
+            self.metric_labels[key] = value
+            self.metrics_grid.add_widget(tile)
+        summary_card.add_widget(self.metrics_grid)
+        self.loss_label = small_label("速度变化：等待分析", height=42, font_size="12sp", color=UI_THEME["amber"])
+        summary_card.add_widget(self.loss_label)
+        self.advice_label = small_label(
+            "完成分析后，这里会显示追踪质量、速度变化和拍摄风险提示。", height=90, font_size="11sp")
+        summary_card.add_widget(self.advice_label)
+        content.add_widget(summary_card)
+
+        # Segment velocity panel: normalized vertical travel thirds, not technical-phase recognition.
+        segment_card = panel("04 行程分区速度", "新增：把每个连续运动片段按垂直行程分为起始、中段、末端三段，分别计算平均垂直速度。")
+        segment_card.add_widget(small_label(
+            "注意：这是按位移范围均分的行程分区，不等同于高翻第一拉/第二拉，也不等同于精确的解剖学或技术阶段。",
+            height=44, font_size="10sp", color=UI_THEME["amber"]))
+        self.result_layout = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None)
+        self.result_layout.bind(minimum_height=self.result_layout.setter("height"))
+        segment_card.add_widget(self.result_layout)
+        content.add_widget(segment_card)
+
+        # Trajectory preview
+        preview_card = panel("05 杠铃轨迹回放", "在原视频上查看识别轨迹，拖动进度条可定位到不同时间。")
+        self.preview_help = small_label(
+            "单端：绿色线显示标记点轨迹。双端：蓝线/橙线显示两端，绿线显示两端图像中点；杆轴连线仅为画面投影。",
+            height=43, font_size="10sp")
+        preview_card.add_widget(self.preview_help)
+        self.preview_image = KivyImage(size_hint_y=None, height=dp(225), fit_mode="contain")
+        preview_card.add_widget(self.preview_image)
+        self.preview_status = small_label("分析完成后，这里会显示叠加轨迹的原视频。", height=38, font_size="10sp")
+        preview_card.add_widget(self.preview_status)
+        self.preview_slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(30), disabled=True)
         self.preview_slider.bind(value=self._on_preview_seek)
-        content.add_widget(self.preview_slider)
-        self.preview_time_label = Label(text="00:00.00 / 00:00.00", size_hint_y=None, height=dp(24), font_size="11sp")
-        content.add_widget(self.preview_time_label)
-        preview_buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        self.preview_play_btn = Button(text="播放轨迹视频", disabled=True)
-        self.preview_pause_btn = Button(text="暂停", disabled=True)
-        self.preview_restart_btn = Button(text="从头播放", disabled=True)
+        preview_card.add_widget(self.preview_slider)
+        self.preview_time_label = Label(text="00:00.00 / 00:00.00", size_hint_y=None, height=dp(20),
+                                        font_size="10sp", color=UI_THEME["muted"])
+        preview_card.add_widget(self.preview_time_label)
+        preview_buttons = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(7))
+        self.preview_play_btn = Button(text="播放", disabled=True, font_size="12sp", background_color=UI_THEME["accent_dark"])
+        self.preview_pause_btn = Button(text="暂停", disabled=True, font_size="12sp", background_color=UI_THEME["surface_soft"])
+        self.preview_restart_btn = Button(text="从头播放", disabled=True, font_size="12sp", background_color=UI_THEME["surface_soft"])
         self.preview_play_btn.bind(on_press=self._play_preview)
         self.preview_pause_btn.bind(on_press=self._pause_preview)
         self.preview_restart_btn.bind(on_press=self._restart_preview)
         preview_buttons.add_widget(self.preview_play_btn)
         preview_buttons.add_widget(self.preview_pause_btn)
         preview_buttons.add_widget(self.preview_restart_btn)
-        content.add_widget(preview_buttons)
+        preview_card.add_widget(preview_buttons)
+        content.add_widget(preview_card)
 
-        content.add_widget(self._section_label("05 本次分析摘要"))
-        self.metrics_grid = GridLayout(cols=2, spacing=dp(6), size_hint_y=None, height=dp(168))
-        self.metric_labels = {}
-        for key, caption in [
-            ("avg", "片段平均垂直速度"), ("peak", "最高垂直峰值速度"),
-            ("count", "识别运动片段"), ("coverage", "有效追踪覆盖率"),
-            ("dualcoverage", "双端同时识别率"), ("spacingcv", "两端间距波动 CV"),
-        ]:
-            box = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(2))
-            box.add_widget(Label(text=caption, font_size="12sp"))
-            value = Label(text="-", font_size="18sp", bold=True)
-            box.add_widget(value)
-            self.metric_labels[key] = value
-            self.metrics_grid.add_widget(box)
-        content.add_widget(self.metrics_grid)
-        self.loss_label = Label(text="同方向速度比较：等待分析", size_hint_y=None, height=dp(42), font_size="13sp", halign="left")
-        self._wrap_label(self.loss_label)
-        content.add_widget(self.loss_label)
-        self.advice_label = Label(
-            text="分析提示会在完成后显示。请记住：这是视频估算，不是专业测力设备。",
-            size_hint_y=None, height=dp(68), font_size="12sp", halign="left", valign="middle",
-        )
-        self._wrap_label(self.advice_label)
-        content.add_widget(self.advice_label)
-        content.add_widget(self._section_label("数据指标是什么意思"))
+        # Exercise guide and interpretation
+        guide_card = panel("06 动作阶段参考", "按所选动作切换观察重点；当前版本不会自动判定这些技术阶段。")
+        self.guide_label = Label(text="", size_hint_y=None, height=dp(220), font_size="11sp",
+                                 halign="left", valign="top", color=UI_THEME["text"])
+        self._wrap_label(self.guide_label)
+        self.guide_label.bind(texture_size=lambda obj, size: setattr(obj, "height", max(dp(170), size[1] + dp(14))))
+        guide_card.add_widget(self.guide_label)
+        content.add_widget(guide_card)
+        self.exercise_spinner.bind(text=self._on_exercise_change)
+        self._on_exercise_change(self.exercise_spinner, self.exercise_spinner.text)
+
+        guide_metrics_card = panel("07 指标与测量边界")
         self.metric_guide_label = Label(
             text=(
-                "平均速度：该连续运动片段内，标记点垂直速度绝对值的平均值。\n"
-                "峰值速度：该片段内平滑后垂直速度的最高值。\n"
-                "垂直位移：经标定平面转换后，标记点最高与最低位置之间的垂直距离。\n"
-                "水平漂移：标记点在标定平面内的左右位移范围；不是三维深度位移。\n"
-                "二维路径长度：标记点在标定平面上的估算路径长度，不是三维真实路径。\n"
-                "持续时间：该片段第一个与最后一个有效识别点之间的时间。\n"
-                "识别覆盖率：成功识别到标记的帧数占视频总帧数的比例。\n"
-                "最大连续漏检：相邻两个成功识别帧之间最长的时间间隔。\n"
-                "同方向速度差：仅比较上升为主或下降为主的同方向片段；方向混合或同方向少于两段时不计算。\n"
-                "追踪质量提示只反映识别连续性，不等于测量准确度。"
-                "单端模式只追踪一个彩色标记点；双端模式追踪两种不同颜色并以图像中点近似杠铃中心。"
-                "双端模式可辅助检查投影杆轴和配对稳定性，但不是三维重建，不能消除前后深度视差。"
+                "平均垂直速度：该连续运动片段内，标记点垂直速度绝对值的平均值。\n"
+                "峰值垂直速度：该片段内平滑后垂直速度的最高值。\n"
+                "行程分区速度：沿本片段运动方向，把起点到终点的垂直行程均分为起始、中段、末端三段，分别求该区域的平均垂直速度；不是技术阶段自动识别。\n"
+                "速度损失：当前同方向片段相对本视频最快同方向片段的平均速度下降，不等于生理疲劳百分比。\n"
+                "垂直位移：标定平面内标记点最高与最低位置之间的距离。水平漂移不是三维深度位移。\n"
+                "识别覆盖率反映追踪连续性，不等于速度准确度。双端中点是二维近似，不是三维重建。"
             ),
-            size_hint_y=None, height=dp(190), font_size="12sp", halign="left", valign="top",
-        )
+            size_hint_y=None, height=dp(155), font_size="10sp", halign="left", valign="top", color=UI_THEME["muted"])
         self._wrap_label(self.metric_guide_label)
-        self.metric_guide_label.bind(
-            texture_size=lambda obj, size: setattr(obj, "height", max(dp(190), size[1] + dp(18)))
-        )
-        content.add_widget(self.metric_guide_label)
+        self.metric_guide_label.bind(texture_size=lambda obj, size: setattr(obj, "height", max(dp(145), size[1] + dp(12))))
+        guide_metrics_card.add_widget(self.metric_guide_label)
+        self.camera_result_label = small_label(
+            "拍摄建议：正侧面优先；两点标定适合正侧面比例标定；四点标定只校正与标记运动同一平面内的透视，无法恢复前后深度位移。",
+            height=65, font_size="10sp")
+        guide_metrics_card.add_widget(self.camera_result_label)
+        content.add_widget(guide_metrics_card)
 
-        content.add_widget(self._section_label("06 连续运动片段的计算结果"))
-        self.result_layout = BoxLayout(orientation="vertical", spacing=dp(4), size_hint_y=None)
-        self.result_layout.bind(minimum_height=self.result_layout.setter("height"))
-        content.add_widget(self.result_layout)
-
-        content.add_widget(self._section_label("07 保存与导出"))
-        row3 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
-        self.save_btn = Button(text="保存训练记录", disabled=True)
+        # Save / export / history
+        data_card = panel("08 保存与导出", "训练记录保存在本机；建议定期导出 CSV 并备份。")
+        row3 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        self.save_btn = Button(text="保存训练记录", disabled=True, font_size="12sp",
+                               background_color=UI_THEME["blue"])
         self.save_btn.bind(on_press=self.save_session)
-        row3.add_widget(self.save_btn)
-        self.export_btn = Button(text="导出 CSV", disabled=True)
+        self.export_btn = Button(text="导出 CSV", disabled=True, font_size="12sp",
+                                 background_color=UI_THEME["accent_dark"])
         self.export_btn.bind(on_press=self.export_results)
+        row3.add_widget(self.save_btn)
         row3.add_widget(self.export_btn)
-        content.add_widget(row3)
-        history_btn = Button(text="查看本机历史记录", size_hint_y=None, height=dp(44))
+        data_card.add_widget(row3)
+        history_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        history_btn = Button(text="查看本机历史记录", font_size="11sp", background_color=UI_THEME["surface_soft"])
         history_btn.bind(on_press=self.show_history)
-        content.add_widget(history_btn)
-        clear_btn = Button(text="清空当前结果", size_hint_y=None, height=dp(40))
+        clear_btn = Button(text="清空当前结果", font_size="11sp", background_color=UI_THEME["red"])
         clear_btn.bind(on_press=self.clear_results)
-        content.add_widget(clear_btn)
+        history_row.add_widget(history_btn)
+        history_row.add_widget(clear_btn)
+        data_card.add_widget(history_row)
+        content.add_widget(data_card)
 
-        content.add_widget(self._section_label("08 拍摄角度与测量边界"))
-        self.camera_result_label = Label(
-            text=("拍摄建议：固定手机、避免跟拍/变焦；尽量正侧面，镜头高度接近杠铃活动范围中点。\n"
-                  "角度选项仅用于风险提示，不会把大概角度直接换算成速度修正。\n"
-                  "两点标定适合正侧面；四点标定只校正与标记运动同一平面内的透视，不能恢复前后深度位移。\n"
-                  "本版追踪一个标记点，不要同时使用两个同色标记；结果是标记点二维轨迹，不代表杠铃三维质心。"),
-            font_size="11sp", size_hint_y=None, height=dp(94), halign="left", valign="middle"
-        )
-        self._wrap_label(self.camera_result_label)
-        content.add_widget(self.camera_result_label)
-
-        warning = Label(
-            text="重要：结果受拍摄角度、标记识别、透视和光线影响；请人工核对视频。暂不用于专业负荷决策。",
-            font_size="11sp", size_hint_y=None, height=dp(54),
-        )
-        content.add_widget(warning)
+        footer = Label(text="BARBELLVBT · TRAINING DATA, BETTER DECISIONS", size_hint_y=None,
+                       height=dp(26), font_size="9sp", color=UI_THEME["muted"], halign="center")
+        content.add_widget(footer)
 
         self.scroll.add_widget(content)
         root.add_widget(self.scroll)
@@ -1043,21 +1243,42 @@ class BarbellVBTApp(App):
         return field
 
     def on_start(self):
+        """Android 使用系统文件选择器，不再直接遍历 /storage/emulated/0。"""
         if kivy_platform == "android":
             try:
-                from android.permissions import request_permissions
-                from jnius import autoclass
-                sdk = autoclass("android.os.Build$VERSION").SDK_INT
-                permission = (
-                    "android.permission.READ_MEDIA_VIDEO" if sdk >= 33
-                    else "android.permission.READ_EXTERNAL_STORAGE"
-                )
-                request_permissions([permission])
+                from android import activity
+                activity.bind(on_activity_result=self._on_android_activity_result)
+                self._android_activity_module = activity
+                self._write_diagnostic("APP_START Android SAF document picker registered")
             except Exception as exc:
-                self.status_label.text = f"视频权限申请提示：{exc}"
+                self.status_label.text = f"系统视频选择器初始化失败：{type(exc).__name__}: {exc}"
+                self._write_diagnostic(f"ANDROID_ACTIVITY_BIND_ERROR {type(exc).__name__}: {exc}")
+
+    def on_pause(self):
+        # Android 打开系统文件选择器时会暂停当前 Activity；允许应用正常恢复。
+        return True
 
     def open_filechooser(self, _instance):
-        start_path = "/storage/emulated/0/" if kivy_platform == "android" else os.path.expanduser("~")
+        if kivy_platform == "android":
+            try:
+                from jnius import autoclass
+                Intent = autoclass("android.content.Intent")
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("video/*")
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                PythonActivity.mActivity.startActivityForResult(intent, self.ANDROID_VIDEO_REQUEST_CODE)
+                self.status_label.text = "已打开系统视频选择器。请选择手机中的原始视频文件。"
+                self._write_diagnostic("OPEN_DOCUMENT launched type=video/*")
+            except Exception as exc:
+                self.status_label.text = f"无法打开系统视频选择器：{type(exc).__name__}: {exc}"
+                self._write_diagnostic(f"OPEN_DOCUMENT_LAUNCH_ERROR {type(exc).__name__}: {exc}")
+            return
+
+        # 电脑测试时保留 Kivy 文件选择器；Android 不使用这个直接路径浏览器。
+        start_path = os.path.expanduser("~")
         chooser = FileChooserListView(
             path=start_path,
             filters=["*.mp4", "*.MP4", "*.avi", "*.AVI", "*.mov", "*.MOV", "*.mkv", "*.MKV", "*.3gp", "*.3GP"],
@@ -1075,26 +1296,140 @@ class BarbellVBTApp(App):
 
         def confirm(_btn):
             if chooser.selection:
-                self.clear_results(None)
-                self.selected_video = chooser.selection[0]
-                self.video_label.text = f"已选：{os.path.basename(self.selected_video)}"
-                self.calibration = None
-                self.camera_setup = {}
-                self.calibration_label = "新视频尚未标定：请点击‘拍摄角度与标定’。"
-                self.calibration_status_label.text = self.calibration_label
-                self.camera_result_label.text = (
-                    "角度信息只用于质量提示，不会把用户估计的角度直接当作数学修正。\n"
-                    "四点标定只校正指定平面内的透视；标记离开该平面产生的深度位移无法用单目视频恢复。\n"
-                    "如果镜头明显斜拍，优先重新摆位。"
-                )
-                self.calibrate_btn.disabled = False
-                self.analyze_btn.disabled = True
-                self.status_label.text = "视频已选择。下一步请完成标定。"
+                self._set_selected_video(chooser.selection[0])
             popup.dismiss()
 
         ok_btn.bind(on_press=confirm)
         cancel_btn.bind(on_press=popup.dismiss)
         popup.open()
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        """Receive the SAF URI, then copy it into app-private storage before OpenCV reads it."""
+        try:
+            if int(request_code) != self.ANDROID_VIDEO_REQUEST_CODE:
+                return
+            from jnius import autoclass
+            Activity = autoclass("android.app.Activity")
+            if int(result_code) != int(Activity.RESULT_OK) or intent is None:
+                Clock.schedule_once(lambda _dt: setattr(self.status_label, "text", "已取消视频选择。"), 0)
+                return
+            uri = intent.getData()
+            if uri is None:
+                Clock.schedule_once(lambda _dt: setattr(self.status_label, "text", "没有获取到视频文件，请重新选择。"), 0)
+                return
+            uri_string = str(uri.toString())
+            Clock.schedule_once(lambda _dt, value=uri_string: self._begin_video_import(value), 0)
+        except Exception as exc:
+            self._write_diagnostic(f"ACTIVITY_RESULT_ERROR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            Clock.schedule_once(lambda _dt, msg=f"读取视频选择结果失败：{type(exc).__name__}: {exc}": setattr(self.status_label, "text", msg), 0)
+
+    def _begin_video_import(self, uri_string):
+        self.select_btn.disabled = True
+        self.analyze_btn.disabled = True
+        self.calibrate_btn.disabled = True
+        self.status_label.text = "正在把视频安全导入应用目录，请不要关闭 APP……"
+        threading.Thread(target=self._copy_video_uri_worker, args=(uri_string,), daemon=True).start()
+
+    def _copy_video_uri_worker(self, uri_string):
+        try:
+            destination = self._copy_android_uri_to_private_file(uri_string)
+            size_mb = os.path.getsize(destination) / (1024.0 * 1024.0)
+            self._write_diagnostic(f"VIDEO_IMPORT_OK path={destination} size_mb={size_mb:.2f}")
+            Clock.schedule_once(lambda _dt, p=destination: self._set_selected_video(p), 0)
+        except Exception as exc:
+            self._write_diagnostic(f"VIDEO_IMPORT_ERROR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            message = f"视频导入失败：{type(exc).__name__}: {exc}。请尝试先把视频保存到手机本地‘下载’文件夹，再重新选择。"
+            Clock.schedule_once(lambda _dt, msg=message: self._video_import_failed(msg), 0)
+
+    def _copy_android_uri_to_private_file(self, uri_string):
+        """Copy a content:// document to a normal seekable file for OpenCV/VideoCapture."""
+        from jnius import autoclass, jarray
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        Uri = autoclass("android.net.Uri")
+        activity_obj = PythonActivity.mActivity
+        resolver = activity_obj.getContentResolver()
+        uri = Uri.parse(uri_string)
+        input_stream = resolver.openInputStream(uri)
+        if input_stream is None:
+            raise IOError("Android 文件提供器没有返回可读取的视频流")
+
+        mime = str(resolver.getType(uri) or "video/mp4").lower()
+        extension_map = {
+            "video/mp4": ".mp4",
+            "video/quicktime": ".mov",
+            "video/x-matroska": ".mkv",
+            "video/3gpp": ".3gp",
+            "video/webm": ".webm",
+            "video/avi": ".avi",
+            "video/x-msvideo": ".avi",
+        }
+        extension = extension_map.get(mime, ".mp4")
+        import_dir = os.path.join(self.user_data_dir, "imports")
+        os.makedirs(import_dir, exist_ok=True)
+        destination = os.path.join(import_dir, f"video_{int(time.time())}_{uuid.uuid4().hex[:8]}{extension}")
+        buffer = jarray("b")([0] * 65536)
+        total = 0
+        try:
+            with open(destination, "wb") as output:
+                while True:
+                    count = int(input_stream.read(buffer))
+                    if count < 0:
+                        break
+                    if count == 0:
+                        continue
+                    output.write(bytes((int(buffer[i]) & 0xFF) for i in range(count)))
+                    total += count
+            if total < 1024:
+                raise IOError("选择的文件为空或不是有效视频文件")
+            return destination
+        except Exception:
+            try:
+                if os.path.exists(destination):
+                    os.remove(destination)
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                input_stream.close()
+            except Exception:
+                pass
+
+    def _video_import_failed(self, message):
+        self.select_btn.disabled = False
+        self.calibrate_btn.disabled = self.selected_video is None
+        self.analyze_btn.disabled = True if self.selected_video is None or self.calibration is None else False
+        self.status_label.text = message
+
+    def _set_selected_video(self, video_path):
+        if not video_path or not os.path.isfile(video_path):
+            self._video_import_failed("无法访问所选视频文件。请重新选择手机本地保存的视频。")
+            return
+        try:
+            file_size = os.path.getsize(video_path)
+        except OSError as exc:
+            self._video_import_failed(f"无法读取视频文件信息：{exc}")
+            return
+        if file_size <= 0:
+            self._video_import_failed("所选视频文件大小为 0，请重新选择。")
+            return
+        self.clear_results(None)
+        self.selected_video = os.path.abspath(video_path)
+        self.video_label.text = f"已选：{os.path.basename(self.selected_video)}（{file_size / (1024*1024):.1f} MB）"
+        self.calibration = None
+        self.camera_setup = {}
+        self.calibration_label = "新视频尚未标定：请点击‘拍摄角度与标定’。"
+        self.calibration_status_label.text = self.calibration_label
+        self.camera_result_label.text = (
+            "角度信息只用于质量提示，不会把用户估计的角度直接当作数学修正。\n"
+            "四点标定只校正指定平面内的透视；标记离开该平面产生的深度位移无法用单目视频恢复。\n"
+            "如果镜头明显斜拍，优先重新摆位。"
+        )
+        self.calibrate_btn.disabled = False
+        self.analyze_btn.disabled = True
+        self.select_btn.disabled = False
+        self.status_label.text = "视频已安全导入应用目录。下一步请完成标定。"
+        self._write_diagnostic(f"VIDEO_SELECTED path={self.selected_video} size_bytes={file_size}")
 
     def open_calibration(self, _instance):
         """Interactive two-point scale or four-point planar perspective calibration."""
@@ -1113,6 +1448,19 @@ class BarbellVBTApp(App):
 
         points = []
         frame_h, frame_w = calibration_frame.shape[:2]
+        preview_max_dim = 1280
+        preview_scale = min(1.0, preview_max_dim / float(max(frame_w, frame_h)))
+        if preview_scale < 1.0:
+            display_w = max(1, int(round(frame_w * preview_scale)))
+            display_h = max(1, int(round(frame_h * preview_scale)))
+            calibration_display_frame = cv2.resize(
+                calibration_frame, (display_w, display_h), interpolation=cv2.INTER_AREA
+            )
+        else:
+            display_w, display_h = frame_w, frame_h
+            calibration_display_frame = calibration_frame
+        preview_scale_x = display_w / float(frame_w)
+        preview_scale_y = display_h / float(frame_h)
         box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(5))
         mode_spinner = Spinner(
             text="两点比例标定（正侧面推荐）",
@@ -1192,15 +1540,16 @@ class BarbellVBTApp(App):
         popup = Popup(title="拍摄角度与视频标定", content=box, size_hint=(0.98, 0.97))
 
         def draw_calibration_frame():
-            canvas = calibration_frame.copy()
+            canvas = calibration_display_frame.copy()
             for idx, (px, py) in enumerate(points, start=1):
-                center = (int(round(px)), int(round(py)))
-                cv2.circle(canvas, center, max(8, int(min(frame_w, frame_h) * 0.018)), (0, 255, 255), -1, cv2.LINE_AA)
-                cv2.circle(canvas, center, max(8, int(min(frame_w, frame_h) * 0.018)), (0, 0, 0), 2, cv2.LINE_AA)
+                center = (int(round(px * preview_scale_x)), int(round(py * preview_scale_y)))
+                marker_radius = max(6, int(min(display_w, display_h) * 0.018))
+                cv2.circle(canvas, center, marker_radius, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(canvas, center, marker_radius, (0, 0, 0), 2, cv2.LINE_AA)
                 cv2.putText(canvas, str(idx), (center[0] + 10, center[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(canvas, str(idx), (center[0] + 10, center[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
             rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-            texture = Texture.create(size=(frame_w, frame_h), colorfmt="rgb")
+            texture = Texture.create(size=(display_w, display_h), colorfmt="rgb")
             texture.flip_vertical()
             texture.blit_buffer(rgb.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
             image_widget.texture = texture
@@ -1304,6 +1653,20 @@ class BarbellVBTApp(App):
         if not self.selected_video:
             self.status_label.text = "请先选择训练视频。"
             return
+        if not os.path.isfile(self.selected_video) or not os.access(self.selected_video, os.R_OK):
+            self.status_label.text = "视频文件当前不可读取。请重新选择视频；Android 版本会先把视频复制到应用目录。"
+            self._write_diagnostic(f"PREFLIGHT_FILE_NOT_READABLE path={self.selected_video}")
+            return
+        try:
+            selected_size = os.path.getsize(self.selected_video)
+            if selected_size < 1024:
+                self.status_label.text = "视频文件过小或已损坏，请重新选择。"
+                self._write_diagnostic(f"PREFLIGHT_FILE_TOO_SMALL size_bytes={selected_size}")
+                return
+        except Exception as exc:
+            self.status_label.text = f"读取视频文件信息失败：{exc}"
+            self._write_diagnostic(f"PREFLIGHT_FILE_INFO_ERROR {type(exc).__name__}: {exc}")
+            return
         if not self.calibration or "homography" not in self.calibration:
             self.status_label.text = "请先完成视频标定。没有标定值时，速度和位移单位不可靠。"
             return
@@ -1362,10 +1725,29 @@ class BarbellVBTApp(App):
             if "progress" in data:
                 p = data["progress"]
                 Clock.schedule_once(lambda _dt, value=p: self._set_progress(value))
+            if data.get("stage") == "video_opened":
+                self._write_diagnostic(
+                    f"VIDEO_OPENED fps={data.get('fps')} resolution={data.get('width')}x{data.get('height')} "
+                    f"total_frames={data.get('total_frames')}"
+                )
+            elif data.get("stage") == "frames":
+                self._write_diagnostic(
+                    f"ANALYSIS_FRAMES frame={data.get('frame_count')} total={data.get('total_frames')}"
+                )
         try:
+            file_size = os.path.getsize(path) if os.path.isfile(path) else -1
+            self._write_diagnostic(f"ANALYSIS_BEGIN path={path} size_bytes={file_size} tracking_mode={self.tracking_mode}")
             result = self.analyzer.analyze(path, callback, camera_setup=self.camera_setup)
+            if isinstance(result, dict) and "error" in result:
+                self._write_diagnostic(f"ANALYSIS_RETURNED_ERROR {result['error']}")
+            else:
+                self._write_diagnostic(
+                    f"ANALYSIS_SUCCESS frames={result.get('video_info', {}).get('frame_count')} "
+                    f"segments={len(result.get('results', []))}"
+                )
         except Exception as exc:
-            result = {"error": f"分析异常：{type(exc).__name__}: {exc}"}
+            self._write_diagnostic(f"ANALYSIS_EXCEPTION {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            result = {"error": f"分析异常：{type(exc).__name__}: {exc}。可点击‘查看分析诊断信息’查看详细记录。"}
         Clock.schedule_once(lambda _dt, value=result: self._finish_analysis(value))
 
     def _set_progress(self, progress):
@@ -1384,7 +1766,11 @@ class BarbellVBTApp(App):
         self.results = result["results"]
         self.summary = result["summary"]
         self.trajectory = result.get("trajectory", [])
-        self._load_trajectory_preview(self.selected_video, result)
+        try:
+            self._load_trajectory_preview(self.selected_video, result)
+        except Exception as exc:
+            self._write_diagnostic(f"PREVIEW_INIT_ERROR {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            self._clear_preview("分析已完成，但预览初始化失败。数据结果仍可查看；请稍后重试回放。")
         self.metric_labels["avg"].text = f"{self.summary['mean_velocity']:.3f} m/s"
         self.metric_labels["peak"].text = f"{self.summary['peak_velocity']:.3f} m/s"
         self.metric_labels["count"].text = str(self.summary["segment_count"])
@@ -1410,6 +1796,7 @@ class BarbellVBTApp(App):
             advice += f"\n四点标定矩形内识别点比例：{region_pct:.1f}%。"
         fps_value = self.summary.get("fps", 0)
         advice += f"\n视频报告帧率：{fps_value:.1f} fps。时间按文件帧率估算；若视频经过可变帧率剪辑/转码或慢动作导出，速度可能有额外误差。"
+        advice += f"\n原视频分辨率：{self.summary.get('video_width', 0)}×{self.summary.get('video_height', 0)}；追踪检测画面最长边限制为 {self.summary.get('analysis_max_dimension', 1280)} px，识别坐标已映射回原视频坐标。"
         if fps_value and fps_value < 50:
             advice += " 建议保留手机原始视频；若设备支持，可使用原始 60 fps 或更高帧率拍摄并避免社交平台二次压缩。"
         if self.summary.get("tracking_mode") == "dual":
@@ -1431,18 +1818,51 @@ class BarbellVBTApp(App):
         self.advice_label.text = advice
         self.result_layout.clear_widgets()
         for item in self.results:
-            row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4))
-            text = (
-                f"运动片段 {item['rep']}  /  平均垂直速度 {item['mean_velocity']:.3f} m/s  /  峰值垂直速度 {item['peak_velocity']:.3f} m/s\n"
-                f"垂直位移 {item['displacement']:.3f} m  /  水平漂移 {item['horizontal_drift']:.3f} m  /  时长 {item['duration']:.2f} s\n"
-                f"方向：{item['direction']}  /  二维路径 {item['path_length_2d']:.3f} m  /  "
-                f"同方向速度差：{(str(item['velocity_loss_pct']) + '%') if item['velocity_loss_pct'] is not None else '不可比较'}"
-            )
-            result_label = Label(text=text, font_size="13sp", halign="left", valign="middle")
-            self._wrap_label(result_label)
-            row.add_widget(result_label)
+            row = Panel(orientation="vertical", size_hint_y=None, spacing=dp(7),
+                        padding=(dp(10), dp(9)), panel_color=UI_THEME["surface_alt"])
+            row.bind(minimum_height=row.setter("height"))
+            velocity_loss = (f"速度差 {item['velocity_loss_pct']:.1f}%"
+                             if item.get("velocity_loss_pct") is not None else "速度差：暂不可比较")
+            title_text = f"运动片段 {item['rep']} · {item['direction']}"
+            title_label = Label(text=title_text, size_hint_y=None, height=dp(24), font_size="12sp",
+                                bold=True, halign="left", valign="middle", color=UI_THEME["text"])
+            self._wrap_label(title_label)
+            row.add_widget(title_label)
+            speed_text = (f"平均速度 {item['mean_velocity']:.3f} m/s  ·  "
+                          f"峰值速度 {item['peak_velocity']:.3f} m/s")
+            speed_label = Label(text=speed_text, size_hint_y=None, height=dp(24), font_size="11sp",
+                                halign="left", valign="middle", color=UI_THEME["accent"])
+            self._wrap_label(speed_label)
+            row.add_widget(speed_label)
+            detail_text = (f"垂直位移 {item['displacement']:.3f} m  ·  水平漂移 {item['horizontal_drift']:.3f} m  ·  "
+                           f"时长 {item['duration']:.2f} s  ·  {velocity_loss}")
+            detail_label = Label(text=detail_text, size_hint_y=None, height=dp(35), font_size="10sp",
+                                 halign="left", valign="middle", color=UI_THEME["muted"])
+            self._wrap_label(detail_label)
+            row.add_widget(detail_label)
+
+            zone_values = item.get("range_zone_speeds_m_s", {})
+            zone_grid = GridLayout(cols=3, spacing=dp(6), size_hint_y=None, height=dp(58))
+            for zone_key, zone_title in (("lower", "起始 1/3"), ("middle", "中段 1/3"), ("upper", "末端 1/3")):
+                zone_tile = Panel(orientation="vertical", spacing=dp(1), padding=(dp(5), dp(4)),
+                                  size_hint_y=None, height=dp(56), panel_color=UI_THEME["surface"])
+                zone_tile.add_widget(Label(text=zone_title, font_size="9sp", color=UI_THEME["muted"],
+                                           size_hint_y=None, height=dp(19), halign="center"))
+                zone_value = zone_values.get(zone_key)
+                zone_text = f"{zone_value:.3f}" if zone_value is not None else "—"
+                zone_tile.add_widget(Label(text=zone_text, font_size="14sp", bold=True,
+                                           color=UI_THEME["accent"] if zone_value is not None else UI_THEME["muted"],
+                                           size_hint_y=None, height=dp(24), halign="center"))
+                zone_grid.add_widget(zone_tile)
+            row.add_widget(zone_grid)
+            if all(v is None for v in zone_values.values()):
+                note = Label(text="该片段方向不够单一或有效采样点不足，暂不计算行程分区速度。",
+                             size_hint_y=None, height=dp(27), font_size="9sp", color=UI_THEME["amber"],
+                             halign="left", valign="middle")
+                self._wrap_label(note)
+                row.add_widget(note)
             self.result_layout.add_widget(row)
-        self.status_label.text = f"分析完成：得到 {len(self.results)} 个连续运动片段。请结合轨迹、水平漂移和拍摄提示人工核对；不会自动判定第一拉/第二拉等技术阶段。"
+        self.status_label.text = f"分析完成：得到 {len(self.results)} 个连续运动片段。已计算起始/中段/末端三段行程速度；它们不是自动识别的技术阶段，请结合轨迹视频核对。"
         self.save_btn.disabled = False
         self.export_btn.disabled = False
 
