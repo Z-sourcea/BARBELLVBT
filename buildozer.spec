@@ -9,16 +9,16 @@ package.domain = com.barbellvbt
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas,txt,md
 source.exclude_exts = spec
-source.exclude_dirs = .git,.github,.buildozer,bin,venv,__pycache__,.venv
+source.exclude_dirs = .git,.github,.buildozer,bin,venv,__pycache__,.venv,tests
 
-version = 0.3.1
+version = 0.3.3
 
 # python-for-android develop 当前的 Python 与 hostpython 必须同版本。
 # Kivy 不锁死版本，使用 p4a 自带并测试过的 Android recipe。
 requirements = python3==3.14.2,hostpython3==3.14.2,kivy,numpy,opencv
 
 # 视频文件读取权限
-android.permissions = READ_MEDIA_VIDEO,(name=android.permission.READ_EXTERNAL_STORAGE;maxSdkVersion=32)
+# Android 通过系统 ACTION_OPEN_DOCUMENT 选择视频，使用单文件 URI 授权，不申请整库媒体权限。
 
 # Android 构建配置
 android.api = 35
